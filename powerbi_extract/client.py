@@ -10,6 +10,12 @@ import requests
 from powerbi_extract.dsr_parser import parse_powerbi_dsr_bytes
 
 DEFAULT_URL = "https://wabi-west-us-c-primary-api.analysis.windows.net/public/reports/querydata?synchronous=true"
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+AUTH_STATUS_CODES = {401, 403}
+
+
+class PowerBIAuthError(RuntimeError):
+    """Raised when the report is private, unpublished, or its resource key has expired."""
 
 
 @dataclass
@@ -95,6 +101,43 @@ def build_payload(config, from_entities, select_columns, window_config):
     }
 
 
+def _retry_delay(response, attempt, base_delay):
+    retry_after = response.headers.get("Retry-After") if response is not None else None
+    if retry_after:
+        try:
+            return float(retry_after)
+        except ValueError:
+            pass
+    return base_delay * (2**attempt)
+
+
+def _post_with_retries(http, config, payload, max_retries, base_delay, log):
+    for attempt in range(max_retries + 1):
+        response = http.post(
+            config.url,
+            headers=config.headers(),
+            data=orjson.dumps(payload),
+        )
+
+        if response.status_code == 200:
+            return response
+
+        if response.status_code in AUTH_STATUS_CODES:
+            raise PowerBIAuthError(
+                f"HTTP {response.status_code} from Power BI. This report is either not "
+                "public, or its resource key has expired — re-export a fresh HAR/URL "
+                "capture from the browser."
+            )
+
+        if response.status_code in RETRYABLE_STATUS_CODES and attempt < max_retries:
+            delay = _retry_delay(response, attempt, base_delay)
+            log(f" -> HTTP {response.status_code}, retrying in {delay:.1f}s (attempt {attempt + 1}/{max_retries})")
+            time.sleep(delay)
+            continue
+
+        return response
+
+
 def run_paginated_query(
     config,
     module_name,
@@ -102,14 +145,13 @@ def run_paginated_query(
     select_columns,
     output_path,
     page_size=30000,
-    sleep_between_pages=0.3,
+    sleep_between_pages=0,
+    max_retries=4,
+    retry_base_delay=1.0,
     session=None,
     log=print,
 ):
-    """Fetch all pages for one query module and write them to ``output_path`` as CSV.
-
-    Returns the resulting :class:`polars.DataFrame` (empty if nothing was captured).
-    """
+    """Fetch all pages for one query module and write them to ``output_path`` as CSV."""
     log(f"\n==========================================")
     log(f"Extracting Module: {module_name}")
     log(f"==========================================")
@@ -125,14 +167,10 @@ def run_paginated_query(
             window_config["RestartTokens"] = restart_tokens
 
         payload = build_payload(config, from_entities, select_columns, window_config)
-        response = http.post(
-            config.url,
-            headers=config.headers(),
-            data=orjson.dumps(payload),
-        )
+        response = _post_with_retries(http, config, payload, max_retries, retry_base_delay, log)
 
         if response.status_code != 200:
-            log(f" -> ERROR (HTTP {response.status_code}) on page {page}")
+            log(f" -> ERROR (HTTP {response.status_code}) on page {page}, giving up on this module.")
             break
 
         rows, restart_tokens = parse_powerbi_dsr_bytes(response.content)
@@ -150,7 +188,8 @@ def run_paginated_query(
             break
 
         page += 1
-        time.sleep(sleep_between_pages)
+        if sleep_between_pages:
+            time.sleep(sleep_between_pages)
 
     if all_rows:
         df = pl.DataFrame(all_rows, infer_schema_length=None)

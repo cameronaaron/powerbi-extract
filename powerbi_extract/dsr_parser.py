@@ -14,14 +14,7 @@ def parse_powerbi_dsr_bytes(raw_bytes):
 
 
 def parse_powerbi_dsr_native(response_json):
-    """Same result as :func:`parse_powerbi_dsr`, via the compiled Rust extension.
-
-    Benchmarking showed this is consistently slower than the pure Python
-    path for realistic payload sizes (PyO3's per-object-access overhead
-    outweighs Rust's advantage on a loop dominated by dict/list lookups
-    rather than arithmetic). Kept for experimentation, not used by default.
-    Raises RuntimeError if the native extension wasn't built.
-    """
+    """Same result as :func:`parse_powerbi_dsr`, via the compiled Rust extension. Benchmarked slower than the pure-Python path (PyO3 per-object overhead), kept for experimentation only."""
     if _native is None:
         raise RuntimeError("the powerbi_extract native extension is not built")
     return _native.parse_dsr(response_json)

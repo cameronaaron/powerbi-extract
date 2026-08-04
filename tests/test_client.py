@@ -1,7 +1,8 @@
 import orjson
 import polars as pl
+import pytest
 
-from powerbi_extract.client import ReportConfig, build_payload, run_paginated_query
+from powerbi_extract.client import PowerBIAuthError, ReportConfig, build_payload, run_paginated_query
 
 
 def _config(**overrides):
@@ -39,9 +40,10 @@ def test_build_payload_shapes_column_and_measure_selects():
 
 
 class _FakeResponse:
-    def __init__(self, status_code, payload):
+    def __init__(self, status_code, payload, headers=None):
         self.status_code = status_code
         self.content = orjson.dumps(payload)
+        self.headers = headers or {}
 
 
 def _dsr_payload(rows_c, restart=None, select=None):
@@ -105,7 +107,6 @@ def test_run_paginated_query_paginates_and_dedupes_boundary_row(tmp_path):
         select_columns=[("u", "Name", False), ("u", "Score", False)],
         output_path=str(out),
         session=session,
-        sleep_between_pages=0,
         log=lambda *a, **k: None,
     )
 
@@ -114,7 +115,7 @@ def test_run_paginated_query_paginates_and_dedupes_boundary_row(tmp_path):
 
 
 def test_run_paginated_query_http_error_breaks_and_returns_empty(tmp_path):
-    session = _FakeSession([_FakeResponse(500, {})])
+    session = _FakeSession([_FakeResponse(500, {})] * 5)
     out = tmp_path / "out.csv"
 
     df = run_paginated_query(
@@ -124,6 +125,7 @@ def test_run_paginated_query_http_error_breaks_and_returns_empty(tmp_path):
         select_columns=[("u", "Name", False)],
         output_path=str(out),
         session=session,
+        max_retries=0,
         log=lambda *a, **k: None,
     )
 
@@ -165,3 +167,125 @@ def test_run_paginated_query_uses_default_session_when_none_given(monkeypatch, t
     )
 
     assert df.height == 1
+
+
+def test_run_paginated_query_retries_transient_errors_then_succeeds(tmp_path, monkeypatch):
+    monkeypatch.setattr("powerbi_extract.client.time.sleep", lambda *a, **k: None)
+    payload = _dsr_payload([["Alice", 1]])
+    session = _FakeSession(
+        [
+            _FakeResponse(503, {}),
+            _FakeResponse(429, {}, headers={"Retry-After": "0.1"}),
+            _FakeResponse(200, payload),
+        ]
+    )
+    out = tmp_path / "out.csv"
+
+    df = run_paginated_query(
+        config=_config(),
+        module_name="mod",
+        from_entities={"u": "Units"},
+        select_columns=[("u", "Name", False)],
+        output_path=str(out),
+        session=session,
+        log=lambda *a, **k: None,
+    )
+
+    assert df.height == 1
+    assert session.calls == 3
+
+
+def test_run_paginated_query_retries_use_exponential_backoff_without_retry_after(tmp_path, monkeypatch):
+    delays = []
+    monkeypatch.setattr("powerbi_extract.client.time.sleep", lambda d: delays.append(d))
+    payload = _dsr_payload([["Alice", 1]])
+    session = _FakeSession([_FakeResponse(500, {}), _FakeResponse(200, payload)])
+    out = tmp_path / "out.csv"
+
+    run_paginated_query(
+        config=_config(),
+        module_name="mod",
+        from_entities={"u": "Units"},
+        select_columns=[("u", "Name", False)],
+        output_path=str(out),
+        session=session,
+        retry_base_delay=1.0,
+        log=lambda *a, **k: None,
+    )
+
+    assert delays == [1.0]
+
+
+def test_run_paginated_query_falls_back_to_backoff_on_unparseable_retry_after(tmp_path, monkeypatch):
+    delays = []
+    monkeypatch.setattr("powerbi_extract.client.time.sleep", lambda d: delays.append(d))
+    payload = _dsr_payload([["Alice", 1]])
+    session = _FakeSession(
+        [_FakeResponse(429, {}, headers={"Retry-After": "not-a-number"}), _FakeResponse(200, payload)]
+    )
+    out = tmp_path / "out.csv"
+
+    run_paginated_query(
+        config=_config(),
+        module_name="mod",
+        from_entities={"u": "Units"},
+        select_columns=[("u", "Name", False)],
+        output_path=str(out),
+        session=session,
+        retry_base_delay=2.0,
+        log=lambda *a, **k: None,
+    )
+
+    assert delays == [2.0]
+
+
+def test_run_paginated_query_sleeps_between_pages_when_configured(tmp_path, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("powerbi_extract.client.time.sleep", lambda d: sleeps.append(d))
+    page1 = _dsr_payload([["Alice", 1]], restart={"tok": 1})
+    page2 = _dsr_payload([["Bob", 2]])
+    session = _FakeSession([_FakeResponse(200, page1), _FakeResponse(200, page2)])
+    out = tmp_path / "out.csv"
+
+    run_paginated_query(
+        config=_config(),
+        module_name="mod",
+        from_entities={"u": "Units"},
+        select_columns=[("u", "Name", False)],
+        output_path=str(out),
+        session=session,
+        sleep_between_pages=0.5,
+        log=lambda *a, **k: None,
+    )
+
+    assert sleeps == [0.5]
+
+
+def test_run_paginated_query_raises_auth_error_on_401():
+    session = _FakeSession([_FakeResponse(401, {})])
+
+    with pytest.raises(PowerBIAuthError):
+        run_paginated_query(
+            config=_config(),
+            module_name="mod",
+            from_entities={"u": "Units"},
+            select_columns=[("u", "Name", False)],
+            output_path="unused.csv",
+            session=session,
+            log=lambda *a, **k: None,
+        )
+
+
+def test_run_paginated_query_raises_auth_error_on_403():
+    session = _FakeSession([_FakeResponse(403, {})])
+
+    with pytest.raises(PowerBIAuthError):
+        run_paginated_query(
+            config=_config(),
+            module_name="mod",
+            from_entities={"u": "Units"},
+            select_columns=[("u", "Name", False)],
+            output_path="unused.csv",
+            session=session,
+            log=lambda *a, **k: None,
+        )

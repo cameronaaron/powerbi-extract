@@ -2,17 +2,19 @@
 
 import argparse
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
 from powerbi_extract.client import run_paginated_query
 
 
-def run_modules(modules, report_config, output_dir=".", session=None):
+def run_modules(modules, report_config, output_dir=".", session=None, max_workers=4):
     os.makedirs(output_dir, exist_ok=True)
     http = session or requests.Session()
-    for module in modules:
-        run_paginated_query(
+
+    def run_one(module):
+        return run_paginated_query(
             config=report_config,
             module_name=module.name,
             from_entities=module.from_entities,
@@ -20,6 +22,12 @@ def run_modules(modules, report_config, output_dir=".", session=None):
             output_path=os.path.join(output_dir, module.output_filename),
             session=http,
         )
+
+    if len(modules) <= 1 or max_workers <= 1:
+        return [run_one(module) for module in modules]
+
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(modules))) as pool:
+        return list(pool.map(run_one, modules))
 
 
 def main(modules, report_config, argv=None):
@@ -35,6 +43,12 @@ def main(modules, report_config, argv=None):
         default=".",
         help="Directory to write extracted CSVs into (default: current directory).",
     )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=4,
+        help="Number of modules to extract concurrently (default: 4).",
+    )
     args = parser.parse_args(argv)
 
     all_modules = {m.name: m for m in modules}
@@ -49,4 +63,4 @@ def main(modules, report_config, argv=None):
     else:
         selected = modules
 
-    run_modules(selected, report_config, output_dir=args.output_dir)
+    run_modules(selected, report_config, output_dir=args.output_dir, max_workers=args.max_workers)

@@ -19,9 +19,64 @@ pip install -e .
 
 Requires Python 3.9+. Runtime dependencies: `requests`, `polars`, `orjson`.
 
-## Usage
+## Quick start: auto-run from a HAR file or a URL
 
-Describe the report and the columns you want, then run the extraction:
+You don't have to hand-decode ids and column lists yourself. `powerbi-extract-auto`
+discovers the `ReportConfig` and the table/visual list for you and runs the
+extraction in one shot.
+
+**From a HAR file** (open the report, let it fully load, then in dev tools'
+Network tab choose "Save all as HAR" — no extra install needed):
+
+```bash
+powerbi-extract-auto --har report.har --output-dir data
+```
+
+**From the report's URL directly** (spins up a headless Chromium via
+Playwright, loads the report, captures the `querydata` traffic itself):
+
+```bash
+pip install "powerbi-extract[browser]"
+playwright install chromium
+
+powerbi-extract-auto --url "https://app.powerbi.com/view?r=..." --output-dir data
+```
+
+Both modes print the discovered module names and pull all of them, in
+parallel (`--max-workers`, default 4), by default; pass `--module <name>`
+(repeatable) to limit the run. Useful flags for `--url` mode:
+`--wait-seconds N` to give a slow report more time to finish loading before
+capture ends, and `--headed` to watch the browser instead of running headless
+(handy for debugging).
+
+Discovery (a HAR export or a browser capture) only has to happen once. Save
+it and reuse it on later runs without re-exporting anything:
+
+```bash
+powerbi-extract-auto --har report.har --save-config report.json --output-dir data
+powerbi-extract-auto --config report.json --output-dir data
+```
+
+If the report turns out to be private or its resource key has expired, the
+extraction fails fast with a clear message instead of a bare HTTP status
+code. Transient errors (HTTP 429/500/502/503/504) are retried automatically
+with exponential backoff, honoring `Retry-After` when the server sends one.
+
+The same discovery functions are usable from Python:
+
+```python
+from powerbi_extract import discover_from_har
+from powerbi_extract.browser import discover_from_url  # needs the `browser` extra
+
+config, modules = discover_from_har("report.har")
+# or: config, modules = discover_from_url("https://app.powerbi.com/view?r=...")
+```
+
+## Manual usage
+
+If you'd rather wire up the config and columns yourself (e.g. you only want
+one specific visual, or you're scripting against a report you already know),
+describe the report and the columns you want, then run the extraction:
 
 ```python
 from powerbi_extract import ReportConfig, QueryModule, run_paginated_query
@@ -82,14 +137,27 @@ python your_extract_script.py --module my_table --output-dir data
   (data-shape-result) row format: bitmasks marking repeated/null fields,
   dictionary-encoded categorical values, and mid-stream schema changes.
 - `powerbi_extract/client.py` — builds the query payload, paginates via
-  `RestartTokens` until exhausted, and returns/saves a `polars.DataFrame`.
+  `RestartTokens` until exhausted, retries transient HTTP errors with
+  backoff, raises `PowerBIAuthError` on 401/403, and returns/saves a
+  `polars.DataFrame`.
 - `powerbi_extract/modules.py` — a plain dataclass describing one
   table/visual pull, so a project can declare a list of them.
 - `powerbi_extract/cli.py` — a report-agnostic `argparse` CLI that runs a
-  caller-supplied list of modules against a caller-supplied `ReportConfig`.
+  caller-supplied list of modules, in parallel, against a caller-supplied
+  `ReportConfig`.
+- `powerbi_extract/discover.py` — turns captured `querydata` requests (from a
+  HAR file or a live browser capture) into a `ReportConfig` and a deduplicated
+  list of `QueryModule`s, and can save/load that pair as JSON so discovery
+  only has to happen once.
+- `powerbi_extract/browser.py` — optional Playwright-based capture: loads a
+  public report URL headlessly, scrolls and clicks through its tabs so
+  interaction-triggered visuals fire too, and records the `querydata`
+  traffic.
+- `powerbi_extract/auto.py` — the `powerbi-extract-auto` CLI entry point that
+  wires discovery straight into the paginated extraction.
 
 Nothing in this package knows about any specific report, dataset, or field
-list — that's supplied by the caller.
+list — that's supplied by the caller (or discovered automatically).
 
 ## Testing
 

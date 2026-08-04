@@ -1,15 +1,34 @@
 [project]
 name = "powerbi-extract"
-version = "0.1.0"
+version = "0.2.0"
 description = "Extract tabular data out of Power BI public-report visuals by replaying their querydata calls"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
+authors = [{ name = "Cameron Aaron" }]
+keywords = ["powerbi", "power-bi", "scraper", "etl", "data-extraction"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Utilities",
+]
 dependencies = [
     "requests>=2.31",
     "polars>=1.0",
     "orjson>=3.9",
 ]
+
+[project.urls]
+Homepage = "https://github.com/cameronaaron/powerbi-extract"
+Repository = "https://github.com/cameronaaron/powerbi-extract"
+Issues = "https://github.com/cameronaaron/powerbi-extract/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -17,6 +36,12 @@ dev = [
     "pytest-cov>=5.0",
     "maturin>=1.5,<2.0",
 ]
+browser = [
+    "playwright>=1.40",
+]
+
+[project.scripts]
+powerbi-extract-auto = "powerbi_extract.auto:main"
 
 [build-system]
 requires = ["setuptools>=68"]

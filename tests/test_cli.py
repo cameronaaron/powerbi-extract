@@ -1,3 +1,6 @@
+import threading
+import time
+
 import pytest
 
 from powerbi_extract.cli import main, run_modules
@@ -24,10 +27,39 @@ def test_run_modules_calls_run_paginated_query_per_module(monkeypatch, tmp_path)
 
     monkeypatch.setattr("powerbi_extract.cli.run_paginated_query", fake_run)
 
-    run_modules(_modules(), _config(), output_dir=str(tmp_path))
+    run_modules(_modules(), _config(), output_dir=str(tmp_path), max_workers=1)
 
     assert calls == ["a", "b"]
     assert tmp_path.exists()
+
+
+def test_run_modules_preserves_result_order_when_parallel(monkeypatch, tmp_path):
+    def fake_run(**kwargs):
+        return kwargs["module_name"]
+
+    monkeypatch.setattr("powerbi_extract.cli.run_paginated_query", fake_run)
+
+    results = run_modules(_modules(), _config(), output_dir=str(tmp_path), max_workers=4)
+
+    assert results == ["a", "b"]
+
+
+def test_run_modules_runs_concurrently(monkeypatch, tmp_path):
+    started = threading.Event()
+
+    def fake_run(**kwargs):
+        if kwargs["module_name"] == "a":
+            started.set()
+            time.sleep(0.05)
+        else:
+            assert started.wait(timeout=1)
+        return kwargs["module_name"]
+
+    monkeypatch.setattr("powerbi_extract.cli.run_paginated_query", fake_run)
+
+    results = run_modules(_modules(), _config(), output_dir=str(tmp_path), max_workers=2)
+
+    assert results == ["a", "b"]
 
 
 def test_main_runs_all_modules_by_default(monkeypatch, tmp_path):
@@ -37,7 +69,7 @@ def test_main_runs_all_modules_by_default(monkeypatch, tmp_path):
         lambda **kwargs: calls.append(kwargs["module_name"]),
     )
 
-    main(_modules(), _config(), argv=["--output-dir", str(tmp_path)])
+    main(_modules(), _config(), argv=["--output-dir", str(tmp_path), "--max-workers", "1"])
 
     assert calls == ["a", "b"]
 
@@ -49,7 +81,7 @@ def test_main_runs_only_selected_module(monkeypatch, tmp_path):
         lambda **kwargs: calls.append(kwargs["module_name"]),
     )
 
-    main(_modules(), _config(), argv=["--module", "b", "--output-dir", str(tmp_path)])
+    main(_modules(), _config(), argv=["--module", "b", "--output-dir", str(tmp_path), "--max-workers", "1"])
 
     assert calls == ["b"]
 
