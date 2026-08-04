@@ -4,7 +4,9 @@ import orjson
 
 from powerbi_extract.discover import QUERYDATA_PATH, CapturedRequest, build_config_and_modules
 
-TAB_SELECTOR = "[aria-label='Page navigation'] button, .tabList .tab"
+TAB_SELECTOR = "div.content.text.ui-role-button-text, button.sectionItem, .tabList .tab"
+NEXT_PAGE_SELECTOR = "button[aria-label='Next Page']"
+MAX_PAGE_CLICKS = 20
 
 
 def _load_playwright():
@@ -19,13 +21,28 @@ def _load_playwright():
 
 
 def _visit_all_tabs(page, wait_seconds):
-    tabs = page.query_selector_all(TAB_SELECTOR)
-    for tab in tabs:
+    tab_count = len(page.query_selector_all(TAB_SELECTOR))
+    for index in range(tab_count):
+        tabs = page.query_selector_all(TAB_SELECTOR)
+        if index >= len(tabs):
+            continue
         try:
-            tab.click(timeout=2000)
-            page.wait_for_timeout(min(wait_seconds, 3) * 1000)
+            tabs[index].click(timeout=3000)
+            page.wait_for_timeout(min(wait_seconds, 4) * 1000)
         except Exception:
             continue
+
+
+def _click_through_pages(page, wait_seconds):
+    for _ in range(MAX_PAGE_CLICKS):
+        button = page.query_selector(NEXT_PAGE_SELECTOR)
+        if not button:
+            break
+        try:
+            button.click(timeout=3000)
+        except Exception:
+            break
+        page.wait_for_timeout(min(wait_seconds, 4) * 1000)
 
 
 def _scroll_report(page, wait_seconds):
@@ -41,7 +58,7 @@ def capture_from_url(view_url, wait_seconds=8, headless=True):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
         try:
-            page = browser.new_page()
+            page = browser.new_page(viewport={"width": 1400, "height": 1000})
 
             def on_request(request):
                 if request.method != "POST" or QUERYDATA_PATH not in request.url:
@@ -62,6 +79,7 @@ def capture_from_url(view_url, wait_seconds=8, headless=True):
             page.wait_for_timeout(wait_seconds * 1000)
             _scroll_report(page, wait_seconds)
             _visit_all_tabs(page, wait_seconds)
+            _click_through_pages(page, wait_seconds)
         finally:
             browser.close()
 

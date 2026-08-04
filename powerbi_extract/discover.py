@@ -2,6 +2,7 @@
 
 import base64
 import json
+import re
 from dataclasses import asdict, dataclass
 from urllib.parse import parse_qs, urlparse
 
@@ -11,6 +12,18 @@ from powerbi_extract.client import ReportConfig
 from powerbi_extract.modules import QueryModule
 
 QUERYDATA_PATH = "public/reports/querydata"
+VIEW_URL_RE = re.compile(r"https://app\.powerbi\.com/view\?r=[^\s\"'<>]+")
+
+
+def extract_view_urls(text):
+    """Pull out deduplicated public report view URLs from arbitrary text (e.g. a URL list file)."""
+    seen = set()
+    urls = []
+    for url in VIEW_URL_RE.findall(text):
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
 
 
 @dataclass
@@ -69,7 +82,11 @@ def captured_requests_from_har(har_path):
 
 def _module_from_query(query_container, index):
     query = query_container["Query"]["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]
-    from_entities = {item["Name"]: item["Entity"] for item in query.get("From", [])}
+    from_clause = query.get("From", [])
+    if any("Entity" not in item for item in from_clause):
+        return None
+
+    from_entities = {item["Name"]: item["Entity"] for item in from_clause}
 
     select_columns = []
     for item in query.get("Select", []):
@@ -130,8 +147,10 @@ def build_config_and_modules(captured_requests):
     modules = []
     for index, captured in enumerate(captured_requests):
         module = _module_from_query(captured.body["queries"][0], index)
+        if module is None or not module.select_columns:
+            continue
         shape_key = (tuple(sorted(module.from_entities.items())), tuple(module.select_columns))
-        if shape_key in seen or not module.select_columns:
+        if shape_key in seen:
             continue
         seen.add(shape_key)
         modules.append(module)

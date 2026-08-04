@@ -63,6 +63,9 @@ class _FakePage:
     def query_selector_all(self, selector):
         return self._tabs
 
+    def query_selector(self, selector):
+        return None
+
 
 class _FakeBrowser:
     def __init__(self, requests_to_fire, tabs=None):
@@ -71,7 +74,7 @@ class _FakeBrowser:
         self.closed = False
         self.page = None
 
-    def new_page(self):
+    def new_page(self, viewport=None):
         self.page = _FakePage(self._requests_to_fire, tabs=self._tabs)
         return self.page
 
@@ -172,6 +175,87 @@ def test_capture_from_url_filters_and_captures_requests(monkeypatch):
     assert captured[0].headers["x-powerbi-resourcekey"] == "abc"
     assert tabs[0].clicked
     assert not tabs[1].clicked
+
+
+class _FakeNextPageButton:
+    def __init__(self, raises=False):
+        self.raises = raises
+        self.click_count = 0
+
+    def click(self, timeout=None):
+        self.click_count += 1
+        if self.raises:
+            raise TimeoutError("disabled")
+
+
+class _NextPagePage:
+    def __init__(self, num_pages, raises_on_last=False):
+        self._remaining = num_pages
+        self._raises_on_last = raises_on_last
+        self.buttons = []
+
+    def query_selector(self, selector):
+        if self._remaining <= 0:
+            return None
+        self._remaining -= 1
+        raises = self._raises_on_last and self._remaining == 0
+        button = _FakeNextPageButton(raises=raises)
+        self.buttons.append(button)
+        return button
+
+    def wait_for_timeout(self, ms):
+        pass
+
+
+def test_click_through_pages_stops_when_no_next_button():
+    page = _NextPagePage(num_pages=3)
+
+    browser._click_through_pages(page, wait_seconds=1)
+
+    assert len(page.buttons) == 3
+    assert all(b.click_count == 1 for b in page.buttons)
+
+
+def test_click_through_pages_respects_max_click_cap():
+    page = _NextPagePage(num_pages=browser.MAX_PAGE_CLICKS + 10)
+
+    browser._click_through_pages(page, wait_seconds=1)
+
+    assert len(page.buttons) == browser.MAX_PAGE_CLICKS
+
+
+def test_click_through_pages_stops_when_click_fails():
+    page = _NextPagePage(num_pages=5, raises_on_last=True)
+
+    browser._click_through_pages(page, wait_seconds=1)
+
+    assert page.buttons[-1].raises
+
+
+class _ShrinkingTabsPage:
+    def __init__(self, tabs):
+        self._remaining = list(tabs)
+        self._first_call = True
+
+    def query_selector_all(self, selector):
+        if self._first_call:
+            self._first_call = False
+            return list(self._remaining)
+        if self._remaining:
+            self._remaining.pop()
+        return list(self._remaining)
+
+    def wait_for_timeout(self, ms):
+        pass
+
+
+def test_visit_all_tabs_skips_index_once_fewer_tabs_remain():
+    tabs = [_FakeTab(), _FakeTab(), _FakeTab()]
+    page = _ShrinkingTabsPage(tabs)
+
+    browser._visit_all_tabs(page, wait_seconds=1)
+
+    assert tabs[0].clicked
 
 
 def test_discover_from_url_builds_config_and_modules(monkeypatch):

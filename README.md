@@ -62,6 +62,20 @@ extraction fails fast with a clear message instead of a bare HTTP status
 code. Transient errors (HTTP 429/500/502/503/504) are retried automatically
 with exponential backoff, honoring `Retry-After` when the server sends one.
 
+**Bulk mode**: point `--urls-file` at a text file containing one or more
+public report URLs — blank lines and unrelated text/links in the file are
+ignored, so you can drop URLs straight out of a bookmarks export or a notes
+file. Each report is extracted into its own `output-dir/<resource-key>/`
+subfolder; one report failing (dead resource key, private report, etc.)
+doesn't stop the rest, and a pass/fail summary prints at the end:
+
+```bash
+powerbi-extract-auto --urls-file urls.txt --output-dir data --wait-seconds 14
+```
+
+`--module` and `--save-config` aren't supported in this mode since they're
+per-report concepts.
+
 The same discovery functions are usable from Python:
 
 ```python
@@ -147,12 +161,14 @@ python your_extract_script.py --module my_table --output-dir data
   `ReportConfig`.
 - `powerbi_extract/discover.py` — turns captured `querydata` requests (from a
   HAR file or a live browser capture) into a `ReportConfig` and a deduplicated
-  list of `QueryModule`s, and can save/load that pair as JSON so discovery
-  only has to happen once.
+  list of `QueryModule`s, can save/load that pair as JSON so discovery only
+  has to happen once, and skips (rather than crashes on) query shapes it
+  can't generically replay, like DAX subquery sources.
 - `powerbi_extract/browser.py` — optional Playwright-based capture: loads a
-  public report URL headlessly, scrolls and clicks through its tabs so
-  interaction-triggered visuals fire too, and records the `querydata`
-  traffic.
+  public report URL headlessly, scrolls, clicks through both page-tab bars
+  and next-page arrow controls (reports use either navigation style) so
+  interaction-triggered visuals across every page fire, and records the
+  `querydata` traffic.
 - `powerbi_extract/auto.py` — the `powerbi-extract-auto` CLI entry point that
   wires discovery straight into the paginated extraction.
 

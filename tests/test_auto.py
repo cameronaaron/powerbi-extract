@@ -116,3 +116,104 @@ def test_main_surfaces_auth_error_as_clean_exit(monkeypatch, tmp_path, capsys):
         auto.main(["--har", "report.har", "--output-dir", str(tmp_path)])
 
     assert "Error: nope" in capsys.readouterr().err
+
+
+def _fake_url(key):
+    import base64
+    import json
+
+    encoded = base64.b64encode(json.dumps({"k": key, "t": "x", "c": 6}).encode()).decode().rstrip("=")
+    return f"https://app.powerbi.com/view?r={encoded}"
+
+
+def test_run_bulk_extracts_each_url_into_own_subdir(monkeypatch, tmp_path):
+    urls = [_fake_url("key-one"), _fake_url("key-two")]
+    dirs_used = []
+
+    monkeypatch.setattr(auto, "discover", lambda **kwargs: (_config(), _modules()))
+    monkeypatch.setattr(
+        "powerbi_extract.auto.run_modules",
+        lambda modules, config, output_dir, max_workers: dirs_used.append(output_dir),
+    )
+
+    results = auto.run_bulk(urls, output_dir=str(tmp_path))
+
+    assert [status for _, status, _ in results] == ["ok", "ok"]
+    assert dirs_used == [str(tmp_path / "key-one"), str(tmp_path / "key-two")]
+
+
+def test_run_bulk_falls_back_to_index_name_for_unparseable_url(monkeypatch, tmp_path):
+    dirs_used = []
+    monkeypatch.setattr(auto, "discover", lambda **kwargs: (_config(), _modules()))
+    monkeypatch.setattr(
+        "powerbi_extract.auto.run_modules",
+        lambda modules, config, output_dir, max_workers: dirs_used.append(output_dir),
+    )
+
+    auto.run_bulk(["https://app.powerbi.com/view?no-r-param"], output_dir=str(tmp_path))
+
+    assert dirs_used == [str(tmp_path / "report_1")]
+
+
+def test_run_bulk_continues_after_one_report_fails(monkeypatch, tmp_path):
+    urls = [_fake_url("bad"), _fake_url("good")]
+
+    def fake_discover(**kwargs):
+        if kwargs["url"] == urls[0]:
+            raise PowerBIAuthError("expired key")
+        return _config(), _modules()
+
+    monkeypatch.setattr(auto, "discover", fake_discover)
+    monkeypatch.setattr("powerbi_extract.auto.run_modules", lambda *a, **k: None)
+
+    results = auto.run_bulk(urls, output_dir=str(tmp_path))
+
+    assert [status for _, status, _ in results] == ["failed", "ok"]
+    assert "expired key" in results[0][2]
+
+
+def test_main_urls_file_runs_bulk_extraction(monkeypatch, tmp_path, capsys):
+    urls = [_fake_url("aaa"), _fake_url("bbb")]
+    urls_file = tmp_path / "urls.txt"
+    urls_file.write_text("\n".join(urls) + "\nhttps://example.com/not-a-report\n")
+
+    calls = []
+
+    def fake_run_bulk(discovered_urls, **kwargs):
+        calls.append(list(discovered_urls))
+        return [(u, "ok", 3) for u in discovered_urls]
+
+    monkeypatch.setattr(auto, "run_bulk", fake_run_bulk)
+
+    auto.main(["--urls-file", str(urls_file), "--output-dir", str(tmp_path)])
+
+    assert calls == [urls]
+    out = capsys.readouterr().out
+    assert "Found 2 report URL(s)" in out
+    assert "2 succeeded, 0 failed" in out
+
+
+def test_main_urls_file_rejects_module_and_save_config(tmp_path):
+    urls_file = tmp_path / "urls.txt"
+    urls_file.write_text(_fake_url("x"))
+
+    with pytest.raises(SystemExit):
+        auto.main(["--urls-file", str(urls_file), "--module", "a"])
+
+
+def test_main_urls_file_errors_when_none_found(tmp_path):
+    urls_file = tmp_path / "urls.txt"
+    urls_file.write_text("nothing here")
+
+    with pytest.raises(SystemExit):
+        auto.main(["--urls-file", str(urls_file)])
+
+
+def test_main_urls_file_exits_nonzero_when_all_fail(monkeypatch, tmp_path):
+    urls_file = tmp_path / "urls.txt"
+    urls_file.write_text(_fake_url("x"))
+
+    monkeypatch.setattr(auto, "run_bulk", lambda urls, **kwargs: [(urls[0], "failed", "boom")])
+
+    with pytest.raises(SystemExit):
+        auto.main(["--urls-file", str(urls_file), "--output-dir", str(tmp_path)])

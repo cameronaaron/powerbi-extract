@@ -10,6 +10,7 @@ from powerbi_extract.discover import (
     build_config_and_modules,
     captured_requests_from_har,
     discover_from_har,
+    extract_view_urls,
     load_config,
     resource_key_from_view_url,
     save_config,
@@ -115,6 +116,37 @@ def test_build_config_and_modules_no_usable_modules_raises():
         build_config_and_modules(captured)
 
 
+def test_query_with_subquery_from_source_is_skipped_not_crashed():
+    body = _body({"u": "Units"}, [("u", "Name", False)])
+    query = body["queries"][0]["Query"]["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]
+    query["From"] = [
+        {
+            "Name": "q",
+            "Expression": {
+                "Subquery": {
+                    "Query": {
+                        "From": [{"Name": "s", "Entity": "Student Data", "Type": 0}],
+                        "Select": [],
+                    }
+                }
+            },
+        }
+    ]
+    captured = [
+        CapturedRequest(url="https://x", headers={}, body=body),
+        CapturedRequest(
+            url="https://x",
+            headers={},
+            body=_body({"u": "Units"}, [("u", "Name", False)]),
+        ),
+    ]
+
+    config, modules = build_config_and_modules(captured)
+
+    assert len(modules) == 1
+    assert modules[0].from_entities == {"u": "Units"}
+
+
 def test_module_from_query_falls_back_to_index_name_when_no_entities():
     body = _body({}, [])
     query = body["queries"][0]["Query"]["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]
@@ -176,6 +208,27 @@ def test_build_config_and_modules_dedupes_colliding_names():
     assert len(names) == len(set(names))
     filenames = [m.output_filename for m in modules]
     assert len(filenames) == len(set(filenames))
+
+
+def test_extract_view_urls_dedupes_and_ignores_noise():
+    text = """
+    https://app.powerbi.com/view?r=abc123
+
+    https://www.example.com/not-a-report
+    https://app.powerbi.com/view?r=def456&pageName=ReportSection1
+    https://app.powerbi.com/view?r=abc123
+    """
+
+    urls = extract_view_urls(text)
+
+    assert urls == [
+        "https://app.powerbi.com/view?r=abc123",
+        "https://app.powerbi.com/view?r=def456&pageName=ReportSection1",
+    ]
+
+
+def test_extract_view_urls_returns_empty_list_when_none_found():
+    assert extract_view_urls("no report links here") == []
 
 
 def test_save_and_load_config_round_trips(tmp_path):
