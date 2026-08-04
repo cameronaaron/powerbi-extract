@@ -83,14 +83,32 @@ def _module_from_query(query_container, index):
         prop = item[key]["Property"]
         select_columns.append((alias, prop, is_measure))
 
-    entity_names = "_".join(sorted(set(from_entities.values()))) or f"query_{index}"
-    name = entity_names.lower().replace(" ", "_")
+    entity_part = "_".join(sorted(set(from_entities.values()))) or f"query_{index}"
+    column_part = "_".join(prop for _, prop, _ in select_columns)
+    base_name = f"{entity_part}_{column_part}" if column_part else entity_part
+    name = base_name.lower().replace(" ", "_")
     return QueryModule(
         name=name,
         from_entities=from_entities,
         select_columns=select_columns,
         output_filename=f"{name}.csv",
     )
+
+
+def _dedupe_names(modules):
+    seen_counts = {}
+    for module in modules:
+        seen_counts[module.name] = seen_counts.get(module.name, 0) + 1
+
+    seen_so_far = {}
+    for module in modules:
+        if seen_counts[module.name] == 1:
+            continue
+        seen_so_far[module.name] = seen_so_far.get(module.name, 0) + 1
+        suffix = seen_so_far[module.name]
+        module.name = f"{module.name}_{suffix}"
+        module.output_filename = f"{module.name}.csv"
+    return modules
 
 
 def build_config_and_modules(captured_requests):
@@ -121,7 +139,7 @@ def build_config_and_modules(captured_requests):
     if not modules:
         raise ValueError("Captured requests didn't yield any usable query modules.")
 
-    return config, modules
+    return config, _dedupe_names(modules)
 
 
 def discover_from_har(har_path):

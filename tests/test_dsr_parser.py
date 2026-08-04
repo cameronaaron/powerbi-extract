@@ -211,6 +211,57 @@ def test_no_schema_at_all_yields_no_rows():
     assert rows == []
 
 
+def test_single_column_value_read_directly_from_field_code_when_no_c_array():
+    ds = {
+        "ValueDicts": {},
+        "PH": [
+            {
+                "DM0": [
+                    {"S": [{"N": "G0"}], "G0": "< 20 yrs old"},
+                    {"G0": "20-24 yrs old"},
+                ]
+            }
+        ],
+    }
+    payload = {
+        "results": [
+            {
+                "result": {
+                    "data": {
+                        "descriptor": {"Select": [{"Value": "G0", "Name": "Table.Age Group"}]},
+                        "dsr": {"DS": [ds]},
+                    }
+                }
+            }
+        ]
+    }
+    rows, _ = parse_powerbi_dsr(payload)
+
+    assert rows == [{"Age Group": "< 20 yrs old"}, {"Age Group": "20-24 yrs old"}]
+
+
+def test_field_code_direct_value_resolves_through_value_dict_when_int():
+    ds = {
+        "ValueDicts": {"D0": ["low", "high"]},
+        "PH": [{"DM0": [{"S": [{"N": "G0", "DN": "D0"}], "G0": 1}]}],
+    }
+    payload = {
+        "results": [
+            {
+                "result": {
+                    "data": {
+                        "descriptor": {"Select": [{"Value": "G0", "Name": "Table.Level"}]},
+                        "dsr": {"DS": [ds]},
+                    }
+                }
+            }
+        ]
+    }
+    rows, _ = parse_powerbi_dsr(payload)
+
+    assert rows == [{"Level": "high"}]
+
+
 def test_missing_c_values_beyond_available_defaults_to_none():
     ds = {
         "ValueDicts": {},

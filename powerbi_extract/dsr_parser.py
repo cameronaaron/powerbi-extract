@@ -77,6 +77,7 @@ def parse_powerbi_dsr(response_json):
 
             for field_idx in range(schema_len):
                 bit = bit_positions[field_idx]
+                field_code = field_codes[field_idx]
                 if r_mask & bit:
                     val = last_row_values[field_idx]
                 elif null_mask & bit:
@@ -84,12 +85,13 @@ def parse_powerbi_dsr(response_json):
                 elif c_idx < n_c_vals:
                     val = c_vals[c_idx]
                     c_idx += 1
+                elif field_code in entry:
+                    val = entry[field_code]
                 else:
                     val = None
 
                 if type(val) is int:
                     field_info = current_schema[field_idx]
-                    field_code = field_codes[field_idx]
                     dict_key = field_info.get("DN")
                     if not dict_key or dict_key not in value_dicts:
                         if field_code in value_dicts:

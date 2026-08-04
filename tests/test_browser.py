@@ -115,7 +115,18 @@ def _fake_sync_playwright_factory(requests_to_fire, tabs=None):
     return lambda: _FakeSyncPlaywrightCtx(requests_to_fire, tabs=tabs)
 
 
-def test_load_playwright_raises_helpful_error_when_not_installed():
+def test_load_playwright_raises_helpful_error_when_not_installed(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "playwright.sync_api" or name.startswith("playwright"):
+            raise ImportError(f"No module named {name!r}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
     with pytest.raises(RuntimeError, match="Playwright"):
         browser._load_playwright()
 
@@ -175,4 +186,4 @@ def test_discover_from_url_builds_config_and_modules(monkeypatch):
     config, modules = browser.discover_from_url("https://app.powerbi.com/view?r=x")
 
     assert config.resource_key == "k"
-    assert modules[0].name == "units"
+    assert modules[0].name == "units_name"

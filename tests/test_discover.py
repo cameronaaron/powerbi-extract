@@ -96,9 +96,9 @@ def test_build_config_and_modules_dedupes_and_reads_headers():
     assert config.resource_key == "abc"
     assert len(modules) == 2
     names = {m.name for m in modules}
-    assert names == {"units", "people"}
+    assert names == {"units_name_total", "people_email"}
 
-    units = next(m for m in modules if m.name == "units")
+    units = next(m for m in modules if m.name == "units_name_total")
     assert units.select_columns == [("u", "Name", False), ("u", "Total", True)]
 
 
@@ -129,7 +129,7 @@ def test_module_from_query_falls_back_to_index_name_when_no_entities():
 
     config, modules = build_config_and_modules(captured)
 
-    assert modules[0].name == "query_0"
+    assert modules[0].name == "query_0_name"
 
 
 def test_module_from_query_skips_unrecognized_select_items():
@@ -158,7 +158,24 @@ def test_discover_from_har_end_to_end(tmp_path):
     config, modules = discover_from_har(str(har_path))
 
     assert config.resource_key == "key1"
-    assert modules[0].name == "units"
+    assert modules[0].name == "units_name"
+
+
+def test_build_config_and_modules_dedupes_colliding_names():
+    body_a = _body({"u": "Units"}, [("u", "Name", False)])
+    body_b = _body({"u": "Units"}, [("u", "Name", True)])
+
+    captured = [
+        CapturedRequest(url="https://x", headers={}, body=body_a),
+        CapturedRequest(url="https://x", headers={}, body=body_b),
+    ]
+
+    config, modules = build_config_and_modules(captured)
+
+    names = [m.name for m in modules]
+    assert len(names) == len(set(names))
+    filenames = [m.output_filename for m in modules]
+    assert len(filenames) == len(set(filenames))
 
 
 def test_save_and_load_config_round_trips(tmp_path):
