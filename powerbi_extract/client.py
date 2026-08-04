@@ -7,7 +7,7 @@ import orjson
 import polars as pl
 import requests
 
-from powerbi_extract.dsr_parser import parse_powerbi_dsr
+from powerbi_extract.dsr_parser import parse_powerbi_dsr_bytes
 
 DEFAULT_URL = "https://wabi-west-us-c-primary-api.analysis.windows.net/public/reports/querydata?synchronous=true"
 
@@ -135,7 +135,7 @@ def run_paginated_query(
             log(f" -> ERROR (HTTP {response.status_code}) on page {page}")
             break
 
-        rows, restart_tokens = parse_powerbi_dsr(orjson.loads(response.content))
+        rows, restart_tokens = parse_powerbi_dsr_bytes(response.content)
         if not rows:
             log(" -> No additional rows returned.")
             break

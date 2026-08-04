@@ -13,7 +13,7 @@ paginated extraction.
 
 ## Install
 
-```
+```bash
 pip install -e .
 ```
 
@@ -60,7 +60,7 @@ from powerbi_extract.cli import main
 main(modules=[module], report_config=config, argv=["--output-dir", "data"])
 ```
 
-```
+```bash
 python your_extract_script.py --module my_table --output-dir data
 ```
 
@@ -93,12 +93,39 @@ list — that's supplied by the caller.
 
 ## Testing
 
-```
+```bash
 pip install -e ".[dev]"
 pytest
 ```
 
 Coverage is enforced at 100% via `pyproject.toml`.
+
+## Experimental: Rust extension
+
+`src/lib.rs` is a PyO3 extension (`powerbi_extract._native`) that reimplements
+`parse_powerbi_dsr`'s bitmask/dictionary-resolution loop in Rust, built with
+[maturin](https://www.maturin.rs/). It is **not used by default** —
+`parse_powerbi_dsr_bytes` always runs the pure Python path.
+
+Benchmarked across 5k/30k/100k-row synthetic payloads, the Rust version was
+consistently ~25-35% *slower* than pure Python + orjson, not faster. The
+loop is dominated by Python dict/list attribute access, which is already
+C-speed inside CPython; every such access from Rust has to cross the PyO3
+FFI boundary (type checks, `Option`/`Result` wrapping, refcounting), and
+that per-call overhead outweighs anything Rust gains, since there's very
+little actual arithmetic to speed up. The code is kept here as a documented
+experiment and a starting point if the tradeoff ever changes (e.g. a
+workload with heavier per-cell computation).
+
+To build and try it yourself:
+
+```bash
+pip install -e ".[dev]"
+maturin develop --release
+```
+
+Then call `powerbi_extract.dsr_parser.parse_powerbi_dsr_native(response_json)`
+directly (raises `RuntimeError` if the extension isn't built) and compare.
 
 ## License
 
