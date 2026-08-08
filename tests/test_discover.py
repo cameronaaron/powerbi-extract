@@ -24,9 +24,26 @@ class _Cfg:
     model_id = 598501
 
 
+def _template(from_entities, select_columns):
+    from_clause = [{"Name": alias, "Entity": entity, "Type": 0} for alias, entity in from_entities.items()]
+    select_clause = []
+    projections = []
+    for idx, (alias, prop, is_measure) in enumerate(select_columns):
+        key = "Measure" if is_measure else "Column"
+        select_clause.append(
+            {key: {"Expression": {"SourceRef": {"Source": alias}}, "Property": prop}, "Name": f"{alias}.{prop}"}
+        )
+        projections.append(idx)
+    return {
+        "Query": {"Version": 2, "From": from_clause, "Select": select_clause},
+        "Binding": {"Primary": {"Groupings": [{"Projections": projections}]}, "DataReduction": {"DataVolume": 3, "Primary": {"Window": {}}}, "Version": 1},
+        "ExecutionMetricsKind": 1,
+    }
+
+
 def _body(from_entities, select_columns):
     return build_payload(
-        _Cfg(), from_entities=from_entities, select_columns=select_columns, window_config={"Count": 30000}
+        _Cfg(), query_template=_template(from_entities, select_columns), window_config={"Count": 30000}
     )
 
 
@@ -103,6 +120,29 @@ def test_build_config_and_modules_dedupes_and_reads_headers():
     assert units.select_columns == [("u", "Name", False), ("u", "Total", True)]
 
 
+def test_build_config_and_modules_reads_model_id_from_capture():
+    # The model ID isn't a fixed constant across reports/datasets — hardcoding a
+    # default gets every query rejected with 401 PowerBINotAuthorizedException,
+    # since it addresses the wrong model even though the key and query are fine.
+    body = _body({"u": "Units"}, [("u", "Name", False)])
+    body["modelId"] = 123456
+    captured = [CapturedRequest(url="https://x", headers={}, body=body)]
+
+    config, modules = build_config_and_modules(captured)
+
+    assert config.model_id == 123456
+
+
+def test_build_config_and_modules_falls_back_to_default_model_id_when_absent():
+    body = _body({"u": "Units"}, [("u", "Name", False)])
+    del body["modelId"]
+    captured = [CapturedRequest(url="https://x", headers={}, body=body)]
+
+    config, modules = build_config_and_modules(captured)
+
+    assert config.model_id == 598501
+
+
 def test_build_config_and_modules_empty_raises():
     with pytest.raises(ValueError):
         build_config_and_modules([])
@@ -167,12 +207,58 @@ def test_module_from_query_falls_back_to_index_name_when_no_entities():
 def test_module_from_query_skips_unrecognized_select_items():
     body = _body({"u": "Units"}, [("u", "Name", False)])
     query = body["queries"][0]["Query"]["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]
+    query["Select"].append({"HierarchyLevel": {}, "Name": "u.Weird"})
+    captured = [CapturedRequest(url="https://x", headers={}, body=body)]
+
+    config, modules = build_config_and_modules(captured)
+
+    assert modules[0].select_columns == [("u", "Name", False)]
+
+
+def test_module_from_query_skips_malformed_aggregation_item():
+    body = _body({"u": "Units"}, [("u", "Name", False)])
+    query = body["queries"][0]["Query"]["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]
     query["Select"].append({"Aggregation": {}, "Name": "u.Weird"})
     captured = [CapturedRequest(url="https://x", headers={}, body=body)]
 
     config, modules = build_config_and_modules(captured)
 
     assert modules[0].select_columns == [("u", "Name", False)]
+
+
+def test_module_from_query_extracts_aggregation_selects():
+    body = _body({"u": "Units"}, [("u", "Name", False)])
+    query = body["queries"][0]["Query"]["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]
+    query["Select"].append(
+        {
+            "Aggregation": {
+                "Expression": {
+                    "Column": {
+                        "Expression": {"SourceRef": {"Source": "u"}},
+                        "Property": "Empl Unit",
+                    }
+                },
+                "Function": 5,
+            },
+            "Name": "CountNonNull(Units.Empl Unit)",
+        }
+    )
+    captured = [CapturedRequest(url="https://x", headers={}, body=body)]
+
+    config, modules = build_config_and_modules(captured)
+
+    assert modules[0].select_columns == [("u", "Name", False), ("u", "Empl Unit", True)]
+
+
+def test_query_template_preserves_where_clause_that_reconstruction_would_drop():
+    body = _body({"u": "Units"}, [("u", "Name", False)])
+    query = body["queries"][0]["Query"]["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]
+    query["Where"] = [{"Condition": {"In": {"Expressions": [], "Values": [[{"Literal": {"Value": "'2024'"}}]]}}}]
+    captured = [CapturedRequest(url="https://x", headers={}, body=body)]
+
+    config, modules = build_config_and_modules(captured)
+
+    assert modules[0].query_template["Query"]["Where"] == query["Where"]
 
 
 def test_discover_from_har_end_to_end(tmp_path):

@@ -11,7 +11,6 @@ import os
 import sys
 
 from powerbi_extract.cli import run_modules
-from powerbi_extract.client import PowerBIAuthError
 from powerbi_extract.discover import (
     discover_from_har,
     extract_view_urls,
@@ -36,7 +35,7 @@ def discover(har=None, url=None, config=None, wait_seconds=8, headless=True):
     return discover_from_url(url, wait_seconds=wait_seconds, headless=headless)
 
 
-def run_bulk(urls, output_dir, wait_seconds=8, headless=True, max_workers=4):
+def run_bulk(urls, output_dir, wait_seconds=8, headless=True, max_workers=2):
     """Discover and extract each report URL into its own subdirectory of ``output_dir``.
 
     One report failing (private, expired key, unrenderable, etc.) doesn't stop the
@@ -113,8 +112,8 @@ def main(argv=None):
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=4,
-        help="Number of modules to extract concurrently (default: 4).",
+        default=2,
+        help="Number of modules to extract concurrently (default: 2, kept low to avoid triggering Power BI's anonymous-session throttling).",
     )
     parser.add_argument(
         "--wait-seconds",
@@ -176,8 +175,8 @@ def main(argv=None):
     else:
         selected = modules
 
-    try:
-        run_modules(selected, config, output_dir=args.output_dir, max_workers=args.max_workers)
-    except PowerBIAuthError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        raise SystemExit(1) from exc
+    results = run_modules(
+        selected, config, output_dir=args.output_dir, max_workers=args.max_workers
+    )
+    if all(isinstance(r, Exception) for r in results):
+        raise SystemExit(1)

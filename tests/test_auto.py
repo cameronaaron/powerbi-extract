@@ -11,8 +11,20 @@ def _config():
 
 def _modules():
     return [
-        QueryModule(name="a", from_entities={"u": "U"}, select_columns=[("u", "X", False)], output_filename="a.csv"),
-        QueryModule(name="b", from_entities={"u": "U"}, select_columns=[("u", "Y", False)], output_filename="b.csv"),
+        QueryModule(
+            name="a",
+            from_entities={"u": "U"},
+            select_columns=[("u", "X", False)],
+            query_template={"Query": {"From": [], "Select": []}},
+            output_filename="a.csv",
+        ),
+        QueryModule(
+            name="b",
+            from_entities={"u": "U"},
+            select_columns=[("u", "Y", False)],
+            query_template={"Query": {"From": [], "Select": []}},
+            output_filename="b.csv",
+        ),
     ]
 
 
@@ -49,11 +61,13 @@ def test_discover_with_url_delegates(monkeypatch):
 
 def test_main_har_runs_all_discovered_modules(monkeypatch, tmp_path):
     calls = []
+
+    def fake_run_modules(modules, config, output_dir, max_workers):
+        calls.append([m.name for m in modules])
+        return [object() for _ in modules]
+
     monkeypatch.setattr(auto, "discover", lambda **kwargs: (_config(), _modules()))
-    monkeypatch.setattr(
-        "powerbi_extract.auto.run_modules",
-        lambda modules, config, output_dir, max_workers: calls.append([m.name for m in modules]),
-    )
+    monkeypatch.setattr("powerbi_extract.auto.run_modules", fake_run_modules)
 
     auto.main(["--har", "report.har", "--output-dir", str(tmp_path)])
 
@@ -62,11 +76,13 @@ def test_main_har_runs_all_discovered_modules(monkeypatch, tmp_path):
 
 def test_main_selects_specific_module(monkeypatch, tmp_path):
     calls = []
+
+    def fake_run_modules(modules, config, output_dir, max_workers):
+        calls.append([m.name for m in modules])
+        return [object() for _ in modules]
+
     monkeypatch.setattr(auto, "discover", lambda **kwargs: (_config(), _modules()))
-    monkeypatch.setattr(
-        "powerbi_extract.auto.run_modules",
-        lambda modules, config, output_dir, max_workers: calls.append([m.name for m in modules]),
-    )
+    monkeypatch.setattr("powerbi_extract.auto.run_modules", fake_run_modules)
 
     auto.main(["--har", "report.har", "--module", "b", "--output-dir", str(tmp_path)])
 
@@ -95,7 +111,7 @@ def test_main_rejects_both_har_and_url():
 def test_main_saves_config_when_requested(monkeypatch, tmp_path):
     saved = []
     monkeypatch.setattr(auto, "discover", lambda **kwargs: (_config(), _modules()))
-    monkeypatch.setattr("powerbi_extract.auto.run_modules", lambda *a, **k: None)
+    monkeypatch.setattr("powerbi_extract.auto.run_modules", lambda *a, **k: [object(), object()])
     monkeypatch.setattr(auto, "save_config", lambda config, modules, path: saved.append(path))
 
     save_path = str(tmp_path / "saved.json")
@@ -104,18 +120,16 @@ def test_main_saves_config_when_requested(monkeypatch, tmp_path):
     assert saved == [save_path]
 
 
-def test_main_surfaces_auth_error_as_clean_exit(monkeypatch, tmp_path, capsys):
+def test_main_exits_nonzero_when_all_modules_fail(monkeypatch, tmp_path):
     monkeypatch.setattr(auto, "discover", lambda **kwargs: (_config(), _modules()))
 
-    def fake_run_modules(*args, **kwargs):
-        raise PowerBIAuthError("nope")
+    def fake_run_modules(modules, config, output_dir, max_workers):
+        return [PowerBIAuthError("nope") for _ in modules]
 
     monkeypatch.setattr("powerbi_extract.auto.run_modules", fake_run_modules)
 
     with pytest.raises(SystemExit):
         auto.main(["--har", "report.har", "--output-dir", str(tmp_path)])
-
-    assert "Error: nope" in capsys.readouterr().err
 
 
 def _fake_url(key):

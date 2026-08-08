@@ -199,6 +199,41 @@ def test_select_descriptor_without_value_is_skipped():
     assert rows == [{"Name": "Hank"}]
 
 
+def test_matrix_shaped_x_entries_are_skipped_not_emitted_as_null_rows():
+    # Matrix/pivot visuals encode rows as nested {"X": [...]} aggregate slices
+    # instead of the flat {"S"/"C"/"R"} shape — the parser doesn't support
+    # flattening that hierarchy, so it must skip these rather than silently
+    # emit a row of all-None values that looks like real (masked) data.
+    ds = {
+        "ValueDicts": {},
+        "PH": [
+            {"DM0": [{"X": [{"S": [{"N": "A0", "T": 4}], "A0": 14811}, {"A0": 12959}]}]},
+        ],
+    }
+    payload = _wrap(ds)
+
+    rows, _ = parse_powerbi_dsr(payload)
+
+    assert rows == []
+
+
+def test_null_select_descriptor_is_skipped_not_crashed():
+    # A subtotal-only slot (referenced elsewhere via an "A"-prefixed code) shows
+    # up as a bare null in Select to keep the array index-aligned with the
+    # schema — this must be skipped like a missing Value, not crash the parse.
+    ds = {
+        "ValueDicts": {},
+        "PH": [{"DM0": [{"S": [{"N": "G0"}], "C": ["Hank"]}]}],
+    }
+    payload = _wrap(ds)
+    payload["results"][0]["result"]["data"]["descriptor"]["Select"].insert(0, None)
+    payload["results"][0]["result"]["data"]["descriptor"]["Select"].append(None)
+
+    rows, _ = parse_powerbi_dsr(payload)
+
+    assert rows == [{"Name": "Hank"}]
+
+
 def test_no_schema_at_all_yields_no_rows():
     ds = {"ValueDicts": {}, "PH": [{"DM0": [{"C": []}]}]}
     payload = {

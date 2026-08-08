@@ -88,9 +88,12 @@ config, modules = discover_from_har("report.har")
 
 ## Manual usage
 
-If you'd rather wire up the config and columns yourself (e.g. you only want
+If you'd rather wire up the config and query yourself (e.g. you only want
 one specific visual, or you're scripting against a report you already know),
-describe the report and the columns you want, then run the extraction:
+copy the captured request's `Query`/`Binding` object verbatim as
+`query_template` — do not hand-reconstruct it from `From`/`Select` alone,
+since that drops information (filters, aggregated measures) the report may
+require:
 
 ```python
 from powerbi_extract import ReportConfig, QueryModule, run_paginated_query
@@ -100,23 +103,26 @@ config = ReportConfig(
     report_id="...",
     visual_id="...",
     resource_key="...",  # the "k" query-string value in the report's public URL
+    model_id=...,        # top-level "modelId" from the captured request body — varies per report
 )
 
 module = QueryModule(
     name="my_table",
-    from_entities={"u": "My Table"},
+    from_entities={"u": "My Table"},        # introspection/naming only, not sent to the API
     select_columns=[
-        ("u", "Some Column", False),   # (source alias, property name, is_measure)
+        ("u", "Some Column", False),        # ditto — (source alias, property name, is_measure)
         ("u", "Some Measure", True),
     ],
+    # The captured request body's
+    # queries[0].Query.Commands[0].SemanticQueryDataShapeCommand, verbatim.
+    query_template={"Query": {...}, "Binding": {...}, "ExecutionMetricsKind": 1},
     output_filename="my_table.csv",
 )
 
 df = run_paginated_query(
     config=config,
     module_name=module.name,
-    from_entities=module.from_entities,
-    select_columns=module.select_columns,
+    query_template=module.query_template,
     output_path=module.output_filename,
 )
 ```
@@ -142,28 +148,35 @@ python your_extract_script.py --module my_table --output-dir data
    parameter (it's base64-encoded JSON: `{"k": "...", "t": "...", "c": ...}`).
 4. `dataset_id`, `report_id`, and `visual_id` are in the request body's
    `ApplicationContext.Sources[0]` and top-level `DatasetId`.
-5. `from_entities` and `select_columns` mirror the request body's
-   `Query.From` and `Query.Select`.
+5. `model_id` is the request body's top-level `modelId`.
+6. `query_template` is the request body's
+   `queries[0].Query.Commands[0].SemanticQueryDataShapeCommand`, copied as-is.
+   `from_entities`/`select_columns` (mirroring `Query.From`/`Query.Select`)
+   are only used for naming and dedup — they are not sent to the API.
 
 ## Design
 
 - `powerbi_extract/dsr_parser.py` — decodes Power BI's compact DSR
   (data-shape-result) row format: bitmasks marking repeated/null fields,
   dictionary-encoded categorical values, and mid-stream schema changes.
-- `powerbi_extract/client.py` — builds the query payload, paginates via
-  `RestartTokens` until exhausted, retries transient HTTP errors with
-  backoff, raises `PowerBIAuthError` on 401/403, and returns/saves a
-  `polars.DataFrame`.
+- `powerbi_extract/client.py` — replays a captured `query_template` verbatim,
+  overriding only the pagination window for `Window`-shaped queries, retries
+  transient HTTP errors and 401/403 with backoff before raising
+  `PowerBIAuthError`, paginates via `RestartTokens` until exhausted, and
+  returns/saves a `polars.DataFrame`. One module failing doesn't abort a
+  multi-module run — `cli.run_modules` isolates each module's errors.
 - `powerbi_extract/modules.py` — a plain dataclass describing one
   table/visual pull, so a project can declare a list of them.
 - `powerbi_extract/cli.py` — a report-agnostic `argparse` CLI that runs a
   caller-supplied list of modules, in parallel, against a caller-supplied
   `ReportConfig`.
 - `powerbi_extract/discover.py` — turns captured `querydata` requests (from a
-  HAR file or a live browser capture) into a `ReportConfig` and a deduplicated
-  list of `QueryModule`s, can save/load that pair as JSON so discovery only
-  has to happen once, and skips (rather than crashes on) query shapes it
-  can't generically replay, like DAX subquery sources.
+  HAR file or a live browser capture) into a `ReportConfig` (including the
+  per-report `modelId`, read from the capture, not hardcoded) and a
+  deduplicated list of `QueryModule`s carrying the verbatim `query_template`,
+  can save/load that pair as JSON so discovery only has to happen once, and
+  skips (rather than crashes on) query shapes it can't generically handle,
+  like DAX subquery sources.
 - `powerbi_extract/browser.py` — optional Playwright-based capture: loads a
   public report URL headlessly, scrolls, clicks through both page-tab bars
   and next-page arrow controls (reports use either navigation style) so

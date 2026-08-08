@@ -12,6 +12,23 @@ class _Cfg:
     model_id = 598501
 
 
+def _template(from_entities, select_columns):
+    from_clause = [{"Name": alias, "Entity": entity, "Type": 0} for alias, entity in from_entities.items()]
+    select_clause = []
+    projections = []
+    for idx, (alias, prop, is_measure) in enumerate(select_columns):
+        key = "Measure" if is_measure else "Column"
+        select_clause.append(
+            {key: {"Expression": {"SourceRef": {"Source": alias}}, "Property": prop}, "Name": f"{alias}.{prop}"}
+        )
+        projections.append(idx)
+    return {
+        "Query": {"Version": 2, "From": from_clause, "Select": select_clause},
+        "Binding": {"Primary": {"Groupings": [{"Projections": projections}]}, "DataReduction": {"DataVolume": 3, "Primary": {"Window": {}}}, "Version": 1},
+        "ExecutionMetricsKind": 1,
+    }
+
+
 class _FakeRequest:
     def __init__(self, method, url, headers=None, post_data=None):
         self.method = method
@@ -150,7 +167,7 @@ def test_load_playwright_returns_sync_playwright_when_installed(monkeypatch):
 
 def test_capture_from_url_filters_and_captures_requests(monkeypatch):
     good_body = build_payload(
-        _Cfg(), from_entities={"u": "Units"}, select_columns=[("u", "Name", False)], window_config={"Count": 1}
+        _Cfg(), query_template=_template({"u": "Units"}, [("u", "Name", False)]), window_config={"Count": 1}
     )
     requests_to_fire = [
         _FakeRequest("GET", "https://x/public/reports/querydata"),
@@ -260,7 +277,7 @@ def test_visit_all_tabs_skips_index_once_fewer_tabs_remain():
 
 def test_discover_from_url_builds_config_and_modules(monkeypatch):
     good_body = build_payload(
-        _Cfg(), from_entities={"u": "Units"}, select_columns=[("u", "Name", False)], window_config={"Count": 1}
+        _Cfg(), query_template=_template({"u": "Units"}, [("u", "Name", False)]), window_config={"Count": 1}
     )
     from powerbi_extract.discover import CapturedRequest
 

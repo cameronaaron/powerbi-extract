@@ -1,6 +1,7 @@
 """Auto-discover a ReportConfig + QueryModules from captured querydata requests."""
 
 import base64
+import copy
 import json
 import re
 from dataclasses import asdict, dataclass
@@ -81,7 +82,8 @@ def captured_requests_from_har(har_path):
 
 
 def _module_from_query(query_container, index):
-    query = query_container["Query"]["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]
+    command = query_container["Query"]["Commands"][0]["SemanticQueryDataShapeCommand"]
+    query = command["Query"]
     from_clause = query.get("From", [])
     if any("Entity" not in item for item in from_clause):
         return None
@@ -90,15 +92,28 @@ def _module_from_query(query_container, index):
 
     select_columns = []
     for item in query.get("Select", []):
-        if "Column" in item:
-            key, is_measure = "Column", False
-        elif "Measure" in item:
-            key, is_measure = "Measure", True
-        else:
+        try:
+            if "Column" in item:
+                expr = item["Column"]
+                is_measure = False
+            elif "Measure" in item:
+                expr = item["Measure"]
+                is_measure = True
+            elif "Aggregation" in item:
+                # An aggregated measure, e.g. CountNonNull(...) — wraps a Column expression.
+                inner = item["Aggregation"]["Expression"]
+                expr = inner.get("Column", inner)
+                is_measure = True
+            else:
+                continue
+            alias = expr["Expression"]["SourceRef"]["Source"]
+            prop = expr["Property"]
+        except KeyError:
             continue
-        alias = item[key]["Expression"]["SourceRef"]["Source"]
-        prop = item[key]["Property"]
         select_columns.append((alias, prop, is_measure))
+
+    if not select_columns:
+        return None
 
     entity_part = "_".join(sorted(set(from_entities.values()))) or f"query_{index}"
     column_part = "_".join(prop for _, prop, _ in select_columns)
@@ -108,6 +123,7 @@ def _module_from_query(query_container, index):
         name=name,
         from_entities=from_entities,
         select_columns=select_columns,
+        query_template=copy.deepcopy(command),
         output_filename=f"{name}.csv",
     )
 
@@ -135,21 +151,30 @@ def build_config_and_modules(captured_requests):
 
     first = captured_requests[0]
     app_context = first.body["queries"][0]["ApplicationContext"]
-    config = ReportConfig(
+    config_kwargs = dict(
         dataset_id=app_context["DatasetId"],
         report_id=app_context["Sources"][0]["ReportId"],
         visual_id=app_context["Sources"][0]["VisualId"],
         resource_key=_header(first.headers, "X-PowerBI-ResourceKey") or "",
         url=first.url,
     )
+    # The model ID varies per report/dataset — a hardcoded default gets rejected
+    # with 401 PowerBINotAuthorizedException even with a perfectly valid key and
+    # query, since it addresses the wrong model entirely.
+    if "modelId" in first.body:
+        config_kwargs["model_id"] = first.body["modelId"]
+    config = ReportConfig(**config_kwargs)
 
     seen = set()
     modules = []
     for index, captured in enumerate(captured_requests):
         module = _module_from_query(captured.body["queries"][0], index)
-        if module is None or not module.select_columns:
+        if module is None:
             continue
-        shape_key = (tuple(sorted(module.from_entities.items())), tuple(module.select_columns))
+        # Dedupe on the full query shape (including Where/Aggregation), not just
+        # projected columns — two queries can share select columns but differ in
+        # their filter, and collapsing them would silently drop one.
+        shape_key = orjson.dumps(module.query_template, option=orjson.OPT_SORT_KEYS)
         if shape_key in seen:
             continue
         seen.add(shape_key)

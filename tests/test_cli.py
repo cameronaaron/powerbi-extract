@@ -14,8 +14,20 @@ def _config():
 
 def _modules():
     return [
-        QueryModule(name="a", from_entities={"u": "U"}, select_columns=[("u", "X", False)], output_filename="a.csv"),
-        QueryModule(name="b", from_entities={"u": "U"}, select_columns=[("u", "Y", False)], output_filename="b.csv"),
+        QueryModule(
+            name="a",
+            from_entities={"u": "U"},
+            select_columns=[("u", "X", False)],
+            query_template={"Query": {"From": [], "Select": []}},
+            output_filename="a.csv",
+        ),
+        QueryModule(
+            name="b",
+            from_entities={"u": "U"},
+            select_columns=[("u", "Y", False)],
+            query_template={"Query": {"From": [], "Select": []}},
+            output_filename="b.csv",
+        ),
     ]
 
 
@@ -84,6 +96,23 @@ def test_main_runs_only_selected_module(monkeypatch, tmp_path):
     main(_modules(), _config(), argv=["--module", "b", "--output-dir", str(tmp_path), "--max-workers", "1"])
 
     assert calls == ["b"]
+
+
+def test_run_modules_isolates_a_failing_module_and_reports_it(monkeypatch, tmp_path, capsys):
+    def fake_run(**kwargs):
+        if kwargs["module_name"] == "a":
+            raise RuntimeError("boom")
+        return kwargs["module_name"]
+
+    monkeypatch.setattr("powerbi_extract.cli.run_paginated_query", fake_run)
+
+    results = run_modules(_modules(), _config(), output_dir=str(tmp_path), max_workers=1)
+
+    assert isinstance(results[0], RuntimeError)
+    assert results[1] == "b"
+    err = capsys.readouterr().err
+    assert "ERROR extracting 'a': boom" in err
+    assert "1/2 module(s) failed: a" in err
 
 
 def test_main_errors_on_unknown_module(tmp_path, capsys):

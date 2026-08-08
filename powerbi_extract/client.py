@@ -1,5 +1,6 @@
 """Paginated Power BI public-report query-data client."""
 
+import copy
 import time
 from dataclasses import dataclass, field
 
@@ -42,54 +43,53 @@ class ReportConfig:
         return headers
 
 
-def build_payload(config, from_entities, select_columns, window_config):
-    from_clause = [
-        {"Name": alias, "Entity": entity_name, "Type": 0}
-        for alias, entity_name in from_entities.items()
-    ]
+def is_paginated_template(query_template):
+    """Whether a captured query's DataReduction is Window-shaped (a table visual)
+    rather than Top-shaped (a single-value card/KPI measure).
 
-    select_clause = []
-    projections = []
+    Forcing a Window reduction onto a Top-shaped query gets rejected with 401
+    PowerBINotAuthorizedException even with a perfectly valid resource key — the
+    backend checks that the reduction shape matches what the visual actually
+    asked for, not just the key. Top-shaped queries return their (bounded)
+    result in one shot and have no RestartTokens/pagination concept.
+    """
+    # `.get(key, {})` only falls back when the key is absent — some captured
+    # queries carry `"DataReduction": null` explicitly, and chaining `.get` on
+    # that None crashes, so fall back on falsy values too, not just missing keys.
+    binding = query_template.get("Binding") or {}
+    data_reduction = binding.get("DataReduction") or {}
+    primary = data_reduction.get("Primary") or {}
+    return "Window" in primary
 
-    for idx, (alias, prop, is_measure) in enumerate(select_columns):
-        key = "Measure" if is_measure else "Column"
-        select_clause.append(
-            {
-                key: {
-                    "Expression": {"SourceRef": {"Source": alias}},
-                    "Property": prop,
-                },
-                "Name": f"{alias}.{prop}",
-            }
-        )
-        projections.append(idx)
+
+def build_payload(config, query_template, window_config=None):
+    """Build a querydata payload by replaying a captured query verbatim.
+
+    Reports that scope their resource key with a mandatory filter (Where clause)
+    or that select aggregated measures reject a from-scratch reconstruction of
+    the query with 401 PowerBINotAuthorizedException, even though the resource
+    key itself is valid — the backend checks the query shape, not just the key.
+    Replaying the exact captured Query/Select/Where keeps every report's queries
+    authorized. ``window_config`` is only applied for Window-shaped (paginated
+    table) queries; pass None to replay the template's own DataReduction as-is
+    (required for Top-shaped single-value queries — see ``is_paginated_template``).
+    """
+    command = copy.deepcopy(query_template)
+    if window_config is not None:
+        # setdefault only fills in a missing key — a captured query with an
+        # explicit `"Binding": null` or `"DataReduction": null` needs the same
+        # None-vs-missing handling as is_paginated_template above.
+        if not command.get("Binding"):
+            command["Binding"] = {}
+        if not command["Binding"].get("DataReduction"):
+            command["Binding"]["DataReduction"] = {"DataVolume": 3}
+        command["Binding"]["DataReduction"]["Primary"] = {"Window": window_config}
 
     return {
         "version": "1.0.0",
         "queries": [
             {
-                "Query": {
-                    "Commands": [
-                        {
-                            "SemanticQueryDataShapeCommand": {
-                                "Query": {
-                                    "Version": 2,
-                                    "From": from_clause,
-                                    "Select": select_clause,
-                                },
-                                "Binding": {
-                                    "Primary": {"Groupings": [{"Projections": projections}]},
-                                    "DataReduction": {
-                                        "DataVolume": 3,
-                                        "Primary": {"Window": window_config},
-                                    },
-                                    "Version": 1,
-                                },
-                                "ExecutionMetricsKind": 1,
-                            }
-                        }
-                    ]
-                },
+                "Query": {"Commands": [{"SemanticQueryDataShapeCommand": command}]},
                 "ApplicationContext": {
                     "DatasetId": config.dataset_id,
                     "Sources": [{"ReportId": config.report_id, "VisualId": config.visual_id}],
@@ -123,6 +123,19 @@ def _post_with_retries(http, config, payload, max_retries, base_delay, log):
             return response
 
         if response.status_code in AUTH_STATUS_CODES:
+            # A resource key that's genuinely dead fails on the very first request.
+            # Anonymous public-report sessions also return 401/403 under request
+            # bursts (concurrent modules, fast pagination) — indistinguishable from
+            # a dead key except by retrying, so treat it like the other transient
+            # codes before giving up for good.
+            if attempt < max_retries:
+                delay = _retry_delay(response, attempt, base_delay)
+                log(
+                    f" -> HTTP {response.status_code} (possible throttling), retrying in "
+                    f"{delay:.1f}s (attempt {attempt + 1}/{max_retries})"
+                )
+                time.sleep(delay)
+                continue
             raise PowerBIAuthError(
                 f"HTTP {response.status_code} from Power BI. This report is either not "
                 "public, or its resource key has expired — re-export a fresh HAR/URL "
@@ -141,8 +154,7 @@ def _post_with_retries(http, config, payload, max_retries, base_delay, log):
 def run_paginated_query(
     config,
     module_name,
-    from_entities,
-    select_columns,
+    query_template,
     output_path,
     page_size=30000,
     sleep_between_pages=0,
@@ -160,13 +172,19 @@ def run_paginated_query(
     all_rows = []
     restart_tokens = None
     page = 1
+    paginated = is_paginated_template(query_template)
 
     while True:
-        window_config = {"Count": page_size}
-        if restart_tokens:
-            window_config["RestartTokens"] = restart_tokens
+        if paginated:
+            window_config = {"Count": page_size}
+            if restart_tokens:
+                window_config["RestartTokens"] = restart_tokens
+            payload = build_payload(config, query_template, window_config)
+        else:
+            # Top-shaped (single-value) query — replay its own DataReduction as
+            # captured; it has no RestartTokens concept, so this is always one shot.
+            payload = build_payload(config, query_template)
 
-        payload = build_payload(config, from_entities, select_columns, window_config)
         response = _post_with_retries(http, config, payload, max_retries, retry_base_delay, log)
 
         if response.status_code != 200:
@@ -184,7 +202,7 @@ def run_paginated_query(
         all_rows.extend(rows)
         log(f" -> Page {page}: Fetched {len(rows)} rows (Total so far: {len(all_rows)})")
 
-        if not restart_tokens:
+        if not paginated or not restart_tokens:
             break
 
         page += 1

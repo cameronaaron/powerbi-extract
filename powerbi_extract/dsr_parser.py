@@ -37,6 +37,12 @@ def parse_powerbi_dsr(response_json):
         val_to_name = {}
         default_schema = []
         for item in select_descriptors:
+            # Subtotal-only slots (referenced elsewhere via an "A"-prefixed code,
+            # e.g. another descriptor's "Subtotal": ["A0"]) appear as a bare null
+            # here to keep the array index-aligned — they carry no column of
+            # their own and are skipped just like a missing Value code.
+            if not item:
+                continue
             val_code = item.get("Value")
             if not val_code:
                 continue
@@ -55,6 +61,13 @@ def parse_powerbi_dsr(response_json):
         last_row_values = [None] * schema_len
 
         for entry in dm0:
+            if "X" in entry and "C" not in entry:
+                # Matrix/pivot-shaped row (nested row-hierarchy aggregates) — a
+                # different DSR flavor than the flat table rows this parser
+                # handles. Skip rather than emit a garbage all-None row; a
+                # legitimate flat row never carries an "X" key.
+                continue
+
             schema = entry.get("S")
             if schema is not None:
                 current_schema = schema
@@ -112,7 +125,7 @@ def parse_powerbi_dsr(response_json):
             last_row_values = row_values
             parsed_rows.append(dict(zip(col_names, row_values)))
 
-    except (KeyError, IndexError, TypeError):
+    except (KeyError, IndexError, TypeError, AttributeError):
         pass
 
     return parsed_rows, restart_tokens

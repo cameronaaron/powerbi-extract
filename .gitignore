@@ -11,3 +11,13 @@ build/
 /target/
 *.so
 Cargo.lock
+
+# real report URLs/resource keys and saved discovery configs — never commit these
+urls
+urls.txt
+*.har
+saved-config*.json
+data/
+
+# internal dev notes — not for the public README
+NOTES.md
