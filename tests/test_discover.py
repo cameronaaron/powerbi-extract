@@ -1,0 +1,347 @@
+# SPDX-FileCopyrightText: 2026 Cameron Aaron
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+import base64
+import json
+
+import orjson
+import pytest
+
+from powerbi_extract.client import build_payload
+from powerbi_extract.discover import (
+    CapturedRequest,
+    build_config_and_modules,
+    captured_requests_from_har,
+    discover_from_har,
+    extract_view_urls,
+    load_config,
+    resource_key_from_view_url,
+    save_config,
+)
+
+
+class _Cfg:
+    dataset_id = "ds1"
+    report_id = "rep1"
+    visual_id = "vis1"
+    model_id = 598501
+
+
+def _template(from_entities, select_columns):
+    from_clause = [{"Name": alias, "Entity": entity, "Type": 0} for alias, entity in from_entities.items()]
+    select_clause = []
+    projections = []
+    for idx, (alias, prop, is_measure) in enumerate(select_columns):
+        key = "Measure" if is_measure else "Column"
+        select_clause.append(
+            {
+                key: {"Expression": {"SourceRef": {"Source": alias}}, "Property": prop},
+                "Name": f"{alias}.{prop}",
+            }
+        )
+        projections.append(idx)
+    return {
+        "Query": {"Version": 2, "From": from_clause, "Select": select_clause},
+        "Binding": {
+            "Primary": {"Groupings": [{"Projections": projections}]},
+            "DataReduction": {"DataVolume": 3, "Primary": {"Window": {}}},
+            "Version": 1,
+        },
+        "ExecutionMetricsKind": 1,
+    }
+
+
+def _body(from_entities, select_columns):
+    return build_payload(
+        _Cfg(), query_template=_template(from_entities, select_columns), window_config={"Count": 30000}
+    )
+
+
+def _har_entry(method="POST", url="https://x/public/reports/querydata", headers=None, post_text=None):
+    entry = {
+        "request": {
+            "method": method,
+            "url": url,
+            "headers": [{"name": k, "value": v} for k, v in (headers or {}).items()],
+        }
+    }
+    if post_text is not None:
+        entry["request"]["postData"] = {"text": post_text}
+    return entry
+
+
+def test_resource_key_from_view_url_decodes_r_param():
+    r = base64.b64encode(json.dumps({"k": "the-key", "t": 1, "c": 2}).encode()).decode().rstrip("=")
+    url = f"https://app.powerbi.com/view?r={r}"
+
+    assert resource_key_from_view_url(url) == "the-key"
+
+
+def test_resource_key_from_view_url_missing_param_raises():
+    with pytest.raises(ValueError):
+        resource_key_from_view_url("https://app.powerbi.com/view")
+
+
+def test_captured_requests_from_har_filters_and_parses(tmp_path):
+    good_body = _body({"u": "Units"}, [("u", "Name", False)])
+    har = {
+        "log": {
+            "entries": [
+                _har_entry(method="GET"),
+                _har_entry(url="https://x/other/endpoint", post_text="{}"),
+                _har_entry(post_text=None),
+                _har_entry(post_text="not json"),
+                _har_entry(
+                    headers={"X-PowerBI-ResourceKey": "key1"}, post_text=orjson.dumps(good_body).decode()
+                ),
+            ]
+        }
+    }
+    har_path = tmp_path / "report.har"
+    har_path.write_bytes(orjson.dumps(har))
+
+    captured = captured_requests_from_har(str(har_path))
+
+    assert len(captured) == 1
+    assert captured[0].headers["X-PowerBI-ResourceKey"] == "key1"
+    assert captured[0].body["queries"][0]["ApplicationContext"]["DatasetId"] == "ds1"
+
+
+def test_build_config_and_modules_dedupes_and_reads_headers():
+    body_a = _body({"u": "Units"}, [("u", "Name", False), ("u", "Total", True)])
+    body_a_dup = _body({"u": "Units"}, [("u", "Name", False), ("u", "Total", True)])
+    body_b = _body({"p": "People"}, [("p", "Email", False)])
+
+    captured = [
+        CapturedRequest(url="https://x/querydata", headers={"x-powerbi-resourcekey": "abc"}, body=body_a),
+        CapturedRequest(url="https://x/querydata", headers={}, body=body_a_dup),
+        CapturedRequest(url="https://x/querydata", headers={}, body=body_b),
+    ]
+
+    config, modules = build_config_and_modules(captured)
+
+    assert config.dataset_id == "ds1"
+    assert config.report_id == "rep1"
+    assert config.visual_id == "vis1"
+    assert config.resource_key == "abc"
+    assert len(modules) == 2
+    names = {m.name for m in modules}
+    assert names == {"units_name_total", "people_email"}
+
+    units = next(m for m in modules if m.name == "units_name_total")
+    assert units.select_columns == [("u", "Name", False), ("u", "Total", True)]
+
+
+def test_build_config_and_modules_reads_model_id_from_capture():
+    # The model ID isn't a fixed constant across reports/datasets — hardcoding a
+    # default gets every query rejected with 401 PowerBINotAuthorizedException,
+    # since it addresses the wrong model even though the key and query are fine.
+    body = _body({"u": "Units"}, [("u", "Name", False)])
+    body["modelId"] = 123456
+    captured = [CapturedRequest(url="https://x", headers={}, body=body)]
+
+    config, _modules = build_config_and_modules(captured)
+
+    assert config.model_id == 123456
+
+
+def test_build_config_and_modules_leaves_model_id_unset_when_absent():
+    body = _body({"u": "Units"}, [("u", "Name", False)])
+    del body["modelId"]
+    captured = [CapturedRequest(url="https://x", headers={}, body=body)]
+
+    config, _modules = build_config_and_modules(captured)
+
+    assert config.model_id is None
+
+
+def test_build_config_and_modules_empty_raises():
+    with pytest.raises(ValueError):
+        build_config_and_modules([])
+
+
+def test_build_config_and_modules_no_usable_modules_raises():
+    body = _body({}, [])
+    captured = [CapturedRequest(url="https://x", headers={}, body=body)]
+
+    with pytest.raises(ValueError):
+        build_config_and_modules(captured)
+
+
+def test_query_with_subquery_from_source_is_skipped_not_crashed():
+    body = _body({"u": "Units"}, [("u", "Name", False)])
+    query = body["queries"][0]["Query"]["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]
+    query["From"] = [
+        {
+            "Name": "q",
+            "Expression": {
+                "Subquery": {
+                    "Query": {
+                        "From": [{"Name": "s", "Entity": "Student Data", "Type": 0}],
+                        "Select": [],
+                    }
+                }
+            },
+        }
+    ]
+    captured = [
+        CapturedRequest(url="https://x", headers={}, body=body),
+        CapturedRequest(
+            url="https://x",
+            headers={},
+            body=_body({"u": "Units"}, [("u", "Name", False)]),
+        ),
+    ]
+
+    _config, modules = build_config_and_modules(captured)
+
+    assert len(modules) == 1
+    assert modules[0].from_entities == {"u": "Units"}
+
+
+def test_module_from_query_falls_back_to_index_name_when_no_entities():
+    body = _body({}, [])
+    query = body["queries"][0]["Query"]["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]
+    query["Select"] = [
+        {
+            "Column": {"Expression": {"SourceRef": {"Source": "u"}}, "Property": "Name"},
+            "Name": "u.Name",
+        }
+    ]
+    body["queries"][0]["Query"]["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"] = query
+    captured = [CapturedRequest(url="https://x", headers={}, body=body)]
+
+    _config, modules = build_config_and_modules(captured)
+
+    assert modules[0].name == "query_0_name"
+
+
+def test_module_from_query_skips_unrecognized_select_items():
+    body = _body({"u": "Units"}, [("u", "Name", False)])
+    query = body["queries"][0]["Query"]["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]
+    query["Select"].append({"HierarchyLevel": {}, "Name": "u.Weird"})
+    captured = [CapturedRequest(url="https://x", headers={}, body=body)]
+
+    _config, modules = build_config_and_modules(captured)
+
+    assert modules[0].select_columns == [("u", "Name", False)]
+
+
+def test_module_from_query_skips_malformed_aggregation_item():
+    body = _body({"u": "Units"}, [("u", "Name", False)])
+    query = body["queries"][0]["Query"]["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]
+    query["Select"].append({"Aggregation": {}, "Name": "u.Weird"})
+    captured = [CapturedRequest(url="https://x", headers={}, body=body)]
+
+    _config, modules = build_config_and_modules(captured)
+
+    assert modules[0].select_columns == [("u", "Name", False)]
+
+
+def test_module_from_query_extracts_aggregation_selects():
+    body = _body({"u": "Units"}, [("u", "Name", False)])
+    query = body["queries"][0]["Query"]["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]
+    query["Select"].append(
+        {
+            "Aggregation": {
+                "Expression": {
+                    "Column": {
+                        "Expression": {"SourceRef": {"Source": "u"}},
+                        "Property": "Empl Unit",
+                    }
+                },
+                "Function": 5,
+            },
+            "Name": "CountNonNull(Units.Empl Unit)",
+        }
+    )
+    captured = [CapturedRequest(url="https://x", headers={}, body=body)]
+
+    _config, modules = build_config_and_modules(captured)
+
+    assert modules[0].select_columns == [("u", "Name", False), ("u", "Empl Unit", True)]
+
+
+def test_query_template_preserves_where_clause_that_reconstruction_would_drop():
+    body = _body({"u": "Units"}, [("u", "Name", False)])
+    query = body["queries"][0]["Query"]["Commands"][0]["SemanticQueryDataShapeCommand"]["Query"]
+    query["Where"] = [
+        {"Condition": {"In": {"Expressions": [], "Values": [[{"Literal": {"Value": "'2024'"}}]]}}}
+    ]
+    captured = [CapturedRequest(url="https://x", headers={}, body=body)]
+
+    _config, modules = build_config_and_modules(captured)
+
+    assert modules[0].query_template["Query"]["Where"] == query["Where"]
+
+
+def test_discover_from_har_end_to_end(tmp_path):
+    body = _body({"u": "Units"}, [("u", "Name", False)])
+    har = {
+        "log": {
+            "entries": [
+                _har_entry(headers={"X-PowerBI-ResourceKey": "key1"}, post_text=orjson.dumps(body).decode())
+            ]
+        }
+    }
+    har_path = tmp_path / "report.har"
+    har_path.write_bytes(orjson.dumps(har))
+
+    config, modules = discover_from_har(str(har_path))
+
+    assert config.resource_key == "key1"
+    assert modules[0].name == "units_name"
+
+
+def test_build_config_and_modules_dedupes_colliding_names():
+    body_a = _body({"u": "Units"}, [("u", "Name", False)])
+    body_b = _body({"u": "Units"}, [("u", "Name", True)])
+
+    captured = [
+        CapturedRequest(url="https://x", headers={}, body=body_a),
+        CapturedRequest(url="https://x", headers={}, body=body_b),
+    ]
+
+    _config, modules = build_config_and_modules(captured)
+
+    names = [m.name for m in modules]
+    assert len(names) == len(set(names))
+    filenames = [m.output_filename for m in modules]
+    assert len(filenames) == len(set(filenames))
+
+
+def test_extract_view_urls_dedupes_and_ignores_noise():
+    text = """
+    https://app.powerbi.com/view?r=abc123
+
+    https://www.example.com/not-a-report
+    https://app.powerbi.com/view?r=def456&pageName=ReportSection1
+    https://app.powerbi.com/view?r=abc123
+    """
+
+    urls = extract_view_urls(text)
+
+    assert urls == [
+        "https://app.powerbi.com/view?r=abc123",
+        "https://app.powerbi.com/view?r=def456&pageName=ReportSection1",
+    ]
+
+
+def test_extract_view_urls_returns_empty_list_when_none_found():
+    assert extract_view_urls("no report links here") == []
+
+
+def test_save_and_load_config_round_trips(tmp_path):
+    body = _body({"u": "Units"}, [("u", "Name", False), ("u", "Total", True)])
+    captured = [CapturedRequest(url="https://x", headers={"X-PowerBI-ResourceKey": "key1"}, body=body)]
+    config, modules = build_config_and_modules(captured)
+    path = tmp_path / "saved.json"
+
+    save_config(config, modules, str(path))
+    loaded_config, loaded_modules = load_config(str(path))
+
+    assert loaded_config == config
+    assert len(loaded_modules) == len(modules)
+    assert loaded_modules[0].name == modules[0].name
+    assert [tuple(c) for c in loaded_modules[0].select_columns] == modules[0].select_columns
